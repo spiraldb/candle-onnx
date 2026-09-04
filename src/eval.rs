@@ -2633,6 +2633,89 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), output);
             }
+            "EyeLike" => {
+                let input = get(&node.input[0])?;
+                let dims = input.dims();
+                if dims.len() != 2 {
+                    bail!("EyeLike only supports rank-2 inputs, got {dims:?}")
+                }
+                let dtype = get_attr_opt::<i64>(node, "dtype")?
+                    .and_then(|dtype| DataType::try_from(*dtype as i32).ok())
+                    .and_then(dtype)
+                    .unwrap_or(input.dtype());
+                let mut data = vec![0f32; dims[0] * dims[1]];
+                for i in 0..dims[0].min(dims[1]) {
+                    data[i * dims[1] + i] = 1.0;
+                }
+                let output =
+                    Tensor::from_vec(data, (dims[0], dims[1]), input.device())?.to_dtype(dtype)?;
+                values.insert(node.output[0].clone(), output);
+            }
+            "InstanceNormalization" => {
+                let input = get(&node.input[0])?;
+                let scale = get(&node.input[1])?;
+                let bias = get(&node.input[2])?;
+                let eps = get_attr_opt::<f32>(node, "epsilon")?
+                    .copied()
+                    .unwrap_or(1e-5) as f64;
+                let dims = input.dims();
+                if dims.len() < 3 {
+                    bail!("InstanceNormalization input rank must be at least 3")
+                }
+                let reduce_dims = (2..dims.len()).collect::<Vec<_>>();
+                let mean = input.mean_keepdim(reduce_dims.clone())?;
+                let centered = input.broadcast_sub(&mean)?;
+                let var = centered.sqr()?.mean_keepdim(reduce_dims)?;
+                let mut channel_shape = vec![1; dims.len()];
+                channel_shape[1] = dims[1];
+                let output = centered
+                    .broadcast_div(&(var + eps)?.sqrt()?)?
+                    .broadcast_mul(&scale.reshape(channel_shape.as_slice())?)?
+                    .broadcast_add(&bias.reshape(channel_shape.as_slice())?)?;
+                values.insert(node.output[0].clone(), output);
+            }
+            "NonZero" => {
+                let input = get(&node.input[0])?;
+                let dims = input.dims().to_vec();
+                let data = input
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<u8>()?;
+                let rank = dims.len();
+                let mut coords = vec![Vec::new(); rank];
+                for (flat_index, &value) in data.iter().enumerate() {
+                    if value == 0 {
+                        continue;
+                    }
+                    let mut remainder = flat_index;
+                    for axis in (0..rank).rev() {
+                        let dim = dims[axis];
+                        coords[axis].push((remainder % dim) as i64);
+                        remainder /= dim;
+                    }
+                }
+                let count = coords.first().map(Vec::len).unwrap_or_default();
+                let mut output = Vec::with_capacity(rank * count);
+                for axis_coords in coords {
+                    output.extend(axis_coords);
+                }
+                values.insert(
+                    node.output[0].clone(),
+                    Tensor::from_vec(output, (rank, count), input.device())?,
+                );
+            }
+            "TopK" => {
+                let input = get(&node.input[0])?;
+                let k = to_scalar_flexible::<i64>(&get(&node.input[1])?.to_device(&Device::Cpu)?)?
+                    as usize;
+                let axis = get_attr_opt::<i64>(node, "axis")?.copied().unwrap_or(-1);
+                let axis = input.normalize_axis(axis)?;
+                let largest = get_attr_opt::<i64>(node, "largest")?.copied().unwrap_or(1) != 0;
+                let sorted = get_attr_opt::<i64>(node, "sorted")?.copied().unwrap_or(1) != 0;
+                let (values_out, indices_out) = topk(input, k, axis, largest, sorted)?;
+                values.insert(node.output[0].clone(), values_out);
+                values.insert(node.output[1].clone(), indices_out);
+            }
             "GridSample" => {
                 let input = get(&node.input[0])?;
                 let grid = get(&node.input[1])?;
@@ -2661,6 +2744,52 @@ fn simple_eval_(
             Some(value) => Ok((output.name.clone(), value)),
         })
         .collect()
+}
+
+fn topk(
+    input: &Tensor,
+    k: usize,
+    axis: usize,
+    largest: bool,
+    sorted: bool,
+) -> Result<(Tensor, Tensor)> {
+    let dims = input.dims();
+    if dims.len() != 2 || axis != 1 {
+        bail!("TopK only supports rank-2 inputs along axis 1, got shape {dims:?} axis {axis}")
+    }
+    let rows = dims[0];
+    let columns = dims[1];
+    if k > columns {
+        bail!("TopK k={k} exceeds axis size {columns}")
+    }
+    let values = input
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    let mut output_values = Vec::with_capacity(rows * k);
+    let mut output_indices = Vec::with_capacity(rows * k);
+    for row in values {
+        let mut indexed = row.into_iter().enumerate().collect::<Vec<_>>();
+        indexed.sort_by(|lhs, rhs| {
+            let order = lhs.1.total_cmp(&rhs.1);
+            if largest {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+        if !sorted {
+            indexed[..k].sort_by_key(|(index, _)| *index);
+        }
+        for (index, value) in indexed.into_iter().take(k) {
+            output_values.push(value);
+            output_indices.push(index as i64);
+        }
+    }
+    Ok((
+        Tensor::from_vec(output_values, (rows, k), input.device())?.to_dtype(input.dtype())?,
+        Tensor::from_vec(output_indices, (rows, k), input.device())?,
+    ))
 }
 
 fn grid_sample_bilinear(input: &Tensor, grid: &Tensor, align_corners: bool) -> Result<Tensor> {
