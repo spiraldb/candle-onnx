@@ -2547,6 +2547,23 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), output);
             }
+            "GridSample" => {
+                let input = get(&node.input[0])?;
+                let grid = get(&node.input[1])?;
+                let mode = get_attr_opt::<str>(node, "mode")?.unwrap_or("bilinear");
+                let padding_mode = get_attr_opt::<str>(node, "padding_mode")?.unwrap_or("zeros");
+                let align_corners = get_attr_opt::<i64>(node, "align_corners")?
+                    .copied()
+                    .unwrap_or(0)
+                    != 0;
+                if mode != "bilinear" || padding_mode != "zeros" {
+                    bail!(
+                        "GridSample only supports bilinear zero padding, got mode={mode:?} padding_mode={padding_mode:?}"
+                    )
+                }
+                let output = grid_sample_bilinear(input, grid, align_corners)?;
+                values.insert(node.output[0].clone(), output);
+            }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
     }
@@ -2591,6 +2608,99 @@ fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
         shape_out = broadcast_shape(&shape_out, shape)?;
     }
     Ok(shape_out)
+}
+
+fn grid_sample_bilinear(input: &Tensor, grid: &Tensor, align_corners: bool) -> Result<Tensor> {
+    if !matches!(
+        input.dtype(),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64
+    ) {
+        bail!(
+            "GridSample only supports floating-point input tensors, got {:?}",
+            input.dtype()
+        )
+    }
+    if !matches!(
+        grid.dtype(),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64
+    ) {
+        bail!(
+            "GridSample only supports floating-point grid tensors, got {:?}",
+            grid.dtype()
+        )
+    }
+    let (batch, channels, height, width) = input.dims4()?;
+    let grid_dims = grid.dims();
+    if grid_dims.len() != 4 || grid_dims[0] != batch || grid_dims[3] != 2 {
+        bail!(
+            "GridSample expects grid shape [N, H_out, W_out, 2] matching input batch, got input {:?} grid {grid_dims:?}",
+            input.dims()
+        )
+    }
+    let out_h = grid_dims[1];
+    let out_w = grid_dims[2];
+    let output_device = input.device().clone();
+    let input = input.to_device(&Device::Cpu)?;
+    let grid = grid.to_device(&Device::Cpu)?;
+    let input_values = input
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let grid_values = grid.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let mut output = vec![0f32; batch * channels * out_h * out_w];
+    let input_index =
+        |n: usize, c: usize, y: usize, x: usize| ((n * channels + c) * height + y) * width + x;
+    let grid_index =
+        |n: usize, y: usize, x: usize, xy: usize| ((n * out_h + y) * out_w + x) * 2 + xy;
+    let output_index =
+        |n: usize, c: usize, y: usize, x: usize| ((n * channels + c) * out_h + y) * out_w + x;
+    for n in 0..batch {
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let gx = grid_values[grid_index(n, oy, ox, 0)];
+                let gy = grid_values[grid_index(n, oy, ox, 1)];
+                if !gx.is_finite() || !gy.is_finite() {
+                    bail!("GridSample only supports finite grid coordinates")
+                }
+                let ix = unnormalize_grid_coordinate(gx, width, align_corners);
+                let iy = unnormalize_grid_coordinate(gy, height, align_corners);
+                let x0 = ix.floor();
+                let y0 = iy.floor();
+                let x1 = x0 + 1.0;
+                let y1 = y0 + 1.0;
+                let wx0 = x1 - ix;
+                let wx1 = ix - x0;
+                let wy0 = y1 - iy;
+                let wy1 = iy - y0;
+                let points = [
+                    (x0 as isize, y0 as isize, wx0 * wy0),
+                    (x1 as isize, y0 as isize, wx1 * wy0),
+                    (x0 as isize, y1 as isize, wx0 * wy1),
+                    (x1 as isize, y1 as isize, wx1 * wy1),
+                ];
+                for c in 0..channels {
+                    let mut value = 0.0f32;
+                    for (x, y, weight) in points {
+                        if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
+                            value +=
+                                input_values[input_index(n, c, y as usize, x as usize)] * weight;
+                        }
+                    }
+                    output[output_index(n, c, oy, ox)] = value;
+                }
+            }
+        }
+    }
+    Tensor::from_vec(output, (batch, channels, out_h, out_w), &output_device)?
+        .to_dtype(input.dtype())
+}
+
+fn unnormalize_grid_coordinate(value: f32, size: usize, align_corners: bool) -> f32 {
+    if align_corners {
+        ((value + 1.0) * (size as f32 - 1.0)) / 2.0
+    } else {
+        ((value + 1.0) * size as f32 - 1.0) / 2.0
+    }
 }
 
 /// Extract scalar from tensors that may be wrapped in extra dimensions.

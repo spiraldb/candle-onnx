@@ -7226,3 +7226,175 @@ fn test_one_hot() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_grid_sample_bilinear_align_corners() -> Result<()> {
+    let input = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &Device::Cpu)?;
+    let grid = Tensor::from_vec(
+        vec![-1f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
+        (1, 2, 2, 2),
+        &Device::Cpu,
+    )?;
+    let model = grid_sample_model(1);
+    let mut inputs = HashMap::new();
+    inputs.insert(INPUT_X.to_string(), input);
+    inputs.insert(INPUT_Y.to_string(), grid);
+
+    let eval = simple_eval(&model, inputs)?;
+    let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
+
+    assert_eq!(z.dims(), &[1, 1, 2, 2]);
+    assert_eq!(z.flatten_all()?.to_vec1::<f32>()?, vec![1.0, 2.0, 3.0, 4.0]);
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_bilinear_zero_padding() -> Result<()> {
+    let input = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &Device::Cpu)?;
+    let grid = Tensor::from_vec(vec![0f32, 0.0, -2.0, -2.0], (1, 1, 2, 2), &Device::Cpu)?;
+    let model = grid_sample_model(0);
+    let mut inputs = HashMap::new();
+    inputs.insert(INPUT_X.to_string(), input);
+    inputs.insert(INPUT_Y.to_string(), grid);
+
+    let eval = simple_eval(&model, inputs)?;
+    let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
+
+    assert_eq!(z.dims(), &[1, 1, 1, 2]);
+    assert_eq!(z.flatten_all()?.to_vec1::<f32>()?, vec![2.5, 0.0]);
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_rejects_unsupported_mode() -> Result<()> {
+    let err = run_grid_sample_error(
+        Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &Device::Cpu)?,
+        Tensor::from_vec(vec![0f32, 0.0], (1, 1, 1, 2), &Device::Cpu)?,
+        grid_sample_model_with_attrs("nearest", "zeros", 0),
+    )?;
+
+    assert!(err.contains("GridSample only supports bilinear zero padding"));
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_rejects_unsupported_padding_mode() -> Result<()> {
+    let err = run_grid_sample_error(
+        Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &Device::Cpu)?,
+        Tensor::from_vec(vec![0f32, 0.0], (1, 1, 1, 2), &Device::Cpu)?,
+        grid_sample_model_with_attrs("bilinear", "border", 0),
+    )?;
+
+    assert!(err.contains("GridSample only supports bilinear zero padding"));
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_rejects_non_4d_input() -> Result<()> {
+    let err = run_grid_sample_error(
+        Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 2), &Device::Cpu)?,
+        Tensor::from_vec(vec![0f32, 0.0], (1, 1, 1, 2), &Device::Cpu)?,
+        grid_sample_model(0),
+    )?;
+
+    assert!(err.contains("unexpected rank"));
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_rejects_bad_grid_shape() -> Result<()> {
+    let err = run_grid_sample_error(
+        Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &Device::Cpu)?,
+        Tensor::from_vec(vec![0f32, 0.0, 0.0], (1, 1, 1, 3), &Device::Cpu)?,
+        grid_sample_model(0),
+    )?;
+
+    assert!(err.contains("GridSample expects grid shape"));
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_rejects_non_float_input() -> Result<()> {
+    let err = run_grid_sample_error(
+        Tensor::from_vec(vec![1i64, 2, 3, 4], (1, 1, 2, 2), &Device::Cpu)?,
+        Tensor::from_vec(vec![0f32, 0.0], (1, 1, 1, 2), &Device::Cpu)?,
+        grid_sample_model(0),
+    )?;
+
+    assert!(err.contains("GridSample only supports floating-point input tensors"));
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_rejects_non_float_grid() -> Result<()> {
+    let err = run_grid_sample_error(
+        Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &Device::Cpu)?,
+        Tensor::from_vec(vec![0i64, 0], (1, 1, 1, 2), &Device::Cpu)?,
+        grid_sample_model(0),
+    )?;
+
+    assert!(err.contains("GridSample only supports floating-point grid tensors"));
+    Ok(())
+}
+
+#[test]
+fn test_grid_sample_rejects_non_finite_grid() -> Result<()> {
+    let err = run_grid_sample_error(
+        Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &Device::Cpu)?,
+        Tensor::from_vec(vec![f32::NAN, 0.0], (1, 1, 1, 2), &Device::Cpu)?,
+        grid_sample_model(0),
+    )?;
+
+    assert!(err.contains("GridSample only supports finite grid coordinates"));
+    Ok(())
+}
+
+fn grid_sample_model(align_corners: i64) -> ModelProto {
+    grid_sample_model_with_attrs("bilinear", "zeros", align_corners)
+}
+
+fn grid_sample_model_with_attrs(mode: &str, padding_mode: &str, align_corners: i64) -> ModelProto {
+    create_model_proto_with_graph(Some(GraphProto {
+        node: vec![NodeProto {
+            op_type: "GridSample".to_string(),
+            input: vec![INPUT_X.to_string(), INPUT_Y.to_string()],
+            output: vec![OUTPUT_Z.to_string()],
+            attribute: vec![
+                AttributeProto {
+                    name: "mode".to_string(),
+                    r#type: AttributeType::String as i32,
+                    s: mode.as_bytes().to_vec(),
+                    ..Default::default()
+                },
+                AttributeProto {
+                    name: "padding_mode".to_string(),
+                    r#type: AttributeType::String as i32,
+                    s: padding_mode.as_bytes().to_vec(),
+                    ..Default::default()
+                },
+                AttributeProto {
+                    name: "align_corners".to_string(),
+                    r#type: AttributeType::Int as i32,
+                    i: align_corners,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        output: vec![ValueInfoProto {
+            name: OUTPUT_Z.to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }))
+}
+
+fn run_grid_sample_error(input: Tensor, grid: Tensor, model: ModelProto) -> Result<String> {
+    let mut inputs = HashMap::new();
+    inputs.insert(INPUT_X.to_string(), input);
+    inputs.insert(INPUT_Y.to_string(), grid);
+    match simple_eval(&model, inputs) {
+        Ok(_) => panic!("GridSample evaluation should fail"),
+        Err(err) => Ok(err.to_string()),
+    }
+}
