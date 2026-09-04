@@ -1,10 +1,11 @@
+use std::collections::{HashMap, HashSet};
+
+use candle::{bail, DType, Device, IndexOp, Module, Result, Tensor};
+use candle_nn::activation::PReLU;
+
 use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
-use candle::Module;
-use candle::{bail, DType, Device, IndexOp, Result, Tensor};
-use candle_nn::activation::PReLU;
-use std::collections::{HashMap, HashSet};
 
 pub type Value = Tensor;
 
@@ -190,6 +191,10 @@ fn get_attr_opt_owned<T: AttrOwned>(node: &onnx::NodeProto, name: &str) -> Resul
 }
 
 pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
+    get_tensor_on_device(t, name, &Device::Cpu)
+}
+
+pub fn get_tensor_on_device(t: &onnx::TensorProto, name: &str, device: &Device) -> Result<Tensor> {
     let dims: Vec<usize> = t.dims.iter().map(|&x| x as usize).collect();
     match DataType::try_from(t.data_type) {
         Ok(DataType::Int32) => {
@@ -198,27 +203,22 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
                 let data: &[i32] =
                     unsafe { std::slice::from_raw_parts(t.raw_data.as_ptr() as *const i32, len) };
                 let data = data.iter().map(|v| *v as i64).collect::<Vec<_>>();
-                Tensor::from_vec(data, len, &Device::Cpu)
+                Tensor::from_vec(data, len, device)
             } else {
                 let data = t.int32_data.iter().map(|v| *v as i64).collect::<Vec<_>>();
-                Tensor::from_vec(data, t.int32_data.len(), &Device::Cpu)
+                Tensor::from_vec(data, t.int32_data.len(), device)
             }
         }
         Ok(dt) => match dtype(dt) {
             Some(dt) => {
                 if dt == DType::F32 && !t.float_data.is_empty() {
-                    Tensor::from_slice(&t.float_data, dims.as_slice(), &Device::Cpu)
+                    Tensor::from_slice(&t.float_data, dims.as_slice(), device)
                 } else if dt == DType::F64 && !t.double_data.is_empty() {
-                    Tensor::from_slice(&t.double_data, dims.as_slice(), &Device::Cpu)
+                    Tensor::from_slice(&t.double_data, dims.as_slice(), device)
                 } else if dt == DType::I64 && !t.int64_data.is_empty() {
-                    Tensor::from_slice(&t.int64_data, dims.as_slice(), &Device::Cpu)
+                    Tensor::from_slice(&t.int64_data, dims.as_slice(), device)
                 } else {
-                    Tensor::from_raw_buffer(
-                        t.raw_data.as_slice(),
-                        dt,
-                        dims.as_slice(),
-                        &Device::Cpu,
-                    )
+                    Tensor::from_raw_buffer(t.raw_data.as_slice(), dt, dims.as_slice(), device)
                 }
             }
             None => {
@@ -238,21 +238,35 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
 // anymore.
 pub fn simple_eval(
     model: &onnx::ModelProto,
+    inputs: HashMap<String, Value>,
+) -> Result<HashMap<String, Value>> {
+    let device = inputs.values().next().map(Tensor::device).cloned();
+    simple_eval_with_device(model, device.as_ref(), inputs)
+}
+
+pub fn simple_eval_with_device(
+    model: &onnx::ModelProto,
+    device: Option<&Device>,
     mut inputs: HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>> {
     let graph = match &model.graph {
         None => bail!("no graph defined in proto"),
         Some(graph) => graph,
     };
-    simple_eval_(graph, &mut inputs)
+    let device = device
+        .or_else(|| inputs.values().next().map(Tensor::device))
+        .cloned()
+        .unwrap_or(Device::Cpu);
+    simple_eval_(graph, &mut inputs, &device)
 }
 
 fn simple_eval_(
     graph: &onnx::GraphProto,
     values: &mut HashMap<String, Value>,
+    device: &Device,
 ) -> Result<HashMap<String, Value>> {
     for t in graph.initializer.iter() {
-        let tensor = get_tensor(t, t.name.as_str())?;
+        let tensor = get_tensor_on_device(t, t.name.as_str(), device)?;
         values.insert(t.name.to_string(), tensor);
     }
     for input in graph.input.iter() {
@@ -337,25 +351,33 @@ fn simple_eval_(
             "Add" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_add(input1)?;
+                let output = input0.broadcast_add(input1).map_err(|error| {
+                    candle::Error::Msg(format!("Add failed for node {:?}: {error}", node.name))
+                })?;
                 values.insert(node.output[0].clone(), output);
             }
             "Sub" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_sub(input1)?;
+                let output = input0.broadcast_sub(input1).map_err(|error| {
+                    candle::Error::Msg(format!("Sub failed for node {:?}: {error}", node.name))
+                })?;
                 values.insert(node.output[0].clone(), output);
             }
             "Mul" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_mul(input1)?;
+                let output = input0.broadcast_mul(input1).map_err(|error| {
+                    candle::Error::Msg(format!("Mul failed for node {:?}: {error}", node.name))
+                })?;
                 values.insert(node.output[0].clone(), output);
             }
             "Div" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_div(input1)?;
+                let output = input0.broadcast_div(input1).map_err(|error| {
+                    candle::Error::Msg(format!("Div failed for node {:?}: {error}", node.name))
+                })?;
                 values.insert(node.output[0].clone(), output);
             }
             "Pow" => {
@@ -395,7 +417,7 @@ fn simple_eval_(
             }
             "Reshape" => {
                 let input0 = get(&node.input[0])?;
-                let input1 = get(&node.input[1])?.to_vec1::<i64>()?;
+                let input1 = to_vec1_host::<i64>(get(&node.input[1])?)?;
                 // TODO: Check that there is at most a single -1 or 0, handle other neg values.
                 let mut other_than_minus1 = 1usize;
                 for &v in input1.iter() {
@@ -562,6 +584,7 @@ fn simple_eval_(
                         .collect()
                 } else {
                     get(&node.input[1])?
+                        .to_device(&Device::Cpu)?
                         .to_vec1::<i64>()?
                         .iter()
                         .map(|&i| xs.normalize_axis(i))
@@ -577,13 +600,12 @@ fn simple_eval_(
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#ConstantOfShape
             "ConstantOfShape" => {
                 let input = get(&node.input[0])?;
-                let value = get_attr_opt_owned::<Tensor>(node, "value")?.unwrap_or(Tensor::zeros(
-                    (),
-                    DType::F32,
-                    &Device::Cpu,
-                )?);
+                let value = get_attr_opt_owned::<Tensor>(node, "value")?
+                    .unwrap_or(Tensor::zeros((), DType::F32, &Device::Cpu)?)
+                    .to_device(input.device())?;
 
                 let shape_vec: Vec<usize> = input
+                    .to_device(&Device::Cpu)?
                     .to_vec1::<i64>()?
                     .iter()
                     .map(|&x| x as usize)
@@ -597,7 +619,7 @@ fn simple_eval_(
                 let xs = get(&node.input[0])?;
                 let axes = match get_attr_opt::<[i64]>(node, "axes")? {
                     Some(axis) => axis.to_vec(),
-                    None => get(&node.input[1])?.to_vec1::<i64>()?,
+                    None => to_vec1_host::<i64>(get(&node.input[1])?)?,
                 };
                 let mut axes = axes
                     .iter()
@@ -616,7 +638,7 @@ fn simple_eval_(
                     .collect::<Result<Vec<_>>>()?;
                 axes.sort();
                 let mut xs = xs.clone();
-                for &axis in axes.iter().rev() {
+                for &axis in axes.iter() {
                     xs = xs.unsqueeze(axis)?
                 }
                 values.insert(node.output[0].clone(), xs);
@@ -659,7 +681,7 @@ fn simple_eval_(
                 // some workarounds must be done.
                 let xs = match indices.dims() {
                     [] => {
-                        let index = indices.to_vec0::<i64>()? as usize;
+                        let index = to_vec0_flexible::<i64>(indices)? as usize;
                         xs.narrow(axis, index, 1)?.squeeze(axis)?
                     }
                     [_] => xs.index_select(indices, axis)?,
@@ -689,7 +711,11 @@ fn simple_eval_(
 
                 let rank = data.rank();
                 if rank != indices.rank() {
-                    bail!("indices must have same rank as input data. Data rank [{}] != indices rank [{}]", data.rank(), indices.rank());
+                    bail!(
+                        "indices must have same rank as input data. Data rank [{}] != indices rank [{}]",
+                        data.rank(),
+                        indices.rank()
+                    );
                 }
 
                 let axis = {
@@ -755,12 +781,12 @@ fn simple_eval_(
                 let delta = get(&node.input[2])?;
 
                 macro_rules! arange_step {
-                    ($t: ty) => {
+                    ($t:ty) => {
                         Tensor::arange_step(
                             to_vec0_flexible::<$t>(start)?,
                             to_vec0_flexible::<$t>(limit)?,
                             to_vec0_flexible::<$t>(delta)?,
-                            &Device::Cpu,
+                            start.device(),
                         )?
                     };
                 }
@@ -1161,7 +1187,7 @@ fn simple_eval_(
                         node.output.len()
                     );
                 }
-                let branch_out = simple_eval_(sub_graph, values)?;
+                let branch_out = simple_eval_(sub_graph, values, device)?;
                 for (i, out) in node.output.iter().enumerate() {
                     values.insert(
                         out.clone(),
@@ -1174,24 +1200,53 @@ fn simple_eval_(
                 let mode = get_attr_opt(node, "mode")?.unwrap_or("constant");
                 let data = get(&node.input[0])?;
                 let pads = get(&node.input[1])?;
-                if node.input.len() > 2 {
+                if node.input.len() > 3 {
                     bail!(
-                        "unsupported number of inputs {} for Pad node {:?}, expected 2",
+                        "unsupported number of inputs {} for Pad node {:?}, expected 2 or 3",
                         node.input.len(),
                         node.name
                     );
                 }
+                let constant_value = get_opt(2)
+                    .transpose()?
+                    .map(to_scalar_flexible::<f64>)
+                    .transpose()?
+                    .unwrap_or(0.0);
                 if pads.rank() != 1 {
                     bail!("Pad expects 'pads' input to be 1D vector: {pads:?}");
                 }
                 if pads.dim(0).unwrap() != 2 * data.rank() {
-                    bail!("Pad expects 'pads' input len to be 2 * rank of 'data' input: pads: {}, data rank: {}", pads, data.rank());
+                    bail!(
+                        "Pad expects 'pads' input len to be 2 * rank of 'data' input: pads: {}, data rank: {}",
+                        pads,
+                        data.rank()
+                    );
                 }
 
-                let pads = pads.to_vec1::<i64>()?;
+                let pads = to_vec1_host::<i64>(pads)?;
                 let (pads_pre, pads_post) = pads.split_at(pads.len() / 2);
 
                 match mode {
+                    "constant" => {
+                        if constant_value != 0.0 {
+                            bail!(
+                                "Pad only supports constant value 0, got {constant_value} for {:?}",
+                                node.name
+                            )
+                        }
+                        let mut out = data.clone();
+                        for (i, _) in data.dims().iter().enumerate().rev() {
+                            if pads_pre[i] == 0 && pads_post[i] == 0 {
+                                continue;
+                            }
+                            if pads_pre[i] < 0 || pads_post[i] < 0 {
+                                bail!("Pad does not support negative pads in node {:?}", node.name)
+                            }
+                            out =
+                                out.pad_with_zeros(i, pads_pre[i] as usize, pads_post[i] as usize)?;
+                        }
+                        values.insert(node.output[0].clone(), out);
+                    }
                     "reflect" => {
                         let mut out = data.clone();
                         for (i, &dim) in data.dims().iter().enumerate().rev() {
@@ -1260,7 +1315,7 @@ fn simple_eval_(
                 }
 
                 let mut out = data.clone();
-                for (i, axis) in axes.to_vec1::<i64>()?.into_iter().enumerate() {
+                for (i, axis) in to_vec1_host::<i64>(axes)?.into_iter().enumerate() {
                     // All negative elements of axes are made non-negative by
                     // adding r to them, where r = rank(input).
                     let axis = if axis < 0 {
@@ -1310,7 +1365,7 @@ fn simple_eval_(
 
                 let axes = if let Some(Ok(axes)) = axes {
                     // Satisfies version 18+
-                    axes.to_vec1::<i64>().ok()
+                    to_vec1_host::<i64>(axes).ok()
                 } else if let Ok(Some(axes)) = get_attr_opt::<[i64]>(node, "axes") {
                     // Backward compatibility with version 13 and below
                     Some(axes.to_vec())
@@ -1351,7 +1406,8 @@ fn simple_eval_(
 
                 // TODO: Handle empty set
                 // Definition:
-                // "Reduction over an empty set of values yields minus infinity (if supported by the datatype) or the minimum value of the data type otherwise"
+                // "Reduction over an empty set of values yields minus infinity (if supported by the
+                // datatype) or the minimum value of the data type otherwise"
                 // For now, this will throw an error
                 if input.elem_count() == 0 {
                     bail!("reduction over zero-size tensor not supported");
@@ -1370,7 +1426,8 @@ fn simple_eval_(
                     result
                 } else {
                     // If `axes` is empty and `noop_with_empty_axes` is set to `true (1)`
-                    // ""input tensor will not be reduced,and the output tensor would be equivalent to input tensor.""
+                    // ""input tensor will not be reduced,and the output tensor would be equivalent
+                    // to input tensor.""
                     if get_attr_opt::<i64>(node, "noop_with_empty_axes")?.copied() == Some(1) {
                         input.clone()
                     } else {
@@ -1419,7 +1476,7 @@ fn simple_eval_(
 
                 let axes = if let Some(Ok(axes)) = axes {
                     // Satisfies version 18+
-                    axes.to_vec1::<i64>().ok()
+                    to_vec1_host::<i64>(axes).ok()
                 } else if let Ok(Some(axes)) = get_attr_opt::<[i64]>(node, "axes") {
                     // Backward compatibility with version 13 and below
                     Some(axes.to_vec())
@@ -1460,7 +1517,8 @@ fn simple_eval_(
 
                 // TODO: Handle empty set
                 // Definition:
-                // "Reduction over an empty set of values yields positive infinity (if supported by the datatype) or the max value of the data type otherwise"
+                // "Reduction over an empty set of values yields positive infinity (if supported by
+                // the datatype) or the max value of the data type otherwise"
                 // For now, this will throw an error
                 if input.elem_count() == 0 {
                     bail!("reduction over zero-size tensor not supported");
@@ -1479,7 +1537,8 @@ fn simple_eval_(
                     result
                 } else {
                     // If `axes` is empty and `noop_with_empty_axes` is set to `true (1)`
-                    // ""input tensor will not be reduced,and the output tensor would be equivalent to input tensor.""
+                    // ""input tensor will not be reduced,and the output tensor would be equivalent
+                    // to input tensor.""
                     if get_attr_opt::<i64>(node, "noop_with_empty_axes")?.copied() == Some(1) {
                         input.clone()
                     } else {
@@ -1507,7 +1566,7 @@ fn simple_eval_(
                 // Determine split sizes
                 let splits = if node.input.len() > 1 {
                     // If the split tensor is provided, use it to determine sizes
-                    let split_tensor = get(&node.input[1])?.to_vec1::<i64>()?;
+                    let split_tensor = to_vec1_host::<i64>(get(&node.input[1])?)?;
                     split_tensor.iter().map(|&x| x as usize).collect::<Vec<_>>()
                 } else {
                     let num_outputs = if let Some(&num_outputs_attrib) =
@@ -1542,7 +1601,7 @@ fn simple_eval_(
                 }
 
                 // Insert the split outputs into the values map
-                for (output, slice) in node.output.iter().zip(outputs.into_iter()) {
+                for (output, slice) in node.output.iter().zip(outputs) {
                     values.insert(output.clone(), slice);
                 }
             }
@@ -1563,6 +1622,7 @@ fn simple_eval_(
                 }
                 let input_tensor_dims = input_tensor.dims();
                 let input_shape_dims = input_shape
+                    .to_device(&Device::Cpu)?
                     .to_vec1::<i64>()?
                     .into_iter()
                     .map(|x| x as usize)
@@ -1577,7 +1637,7 @@ fn simple_eval_(
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Tile
             "Tile" => {
                 let input = get(&node.input[0])?;
-                let repeats = get(&node.input[1])?.to_vec1::<i64>()?;
+                let repeats = to_vec1_host::<i64>(get(&node.input[1])?)?;
 
                 let mut result = input.clone();
                 for (dim, &repeat) in repeats.iter().enumerate() {
@@ -1601,10 +1661,11 @@ fn simple_eval_(
 
                 let axes = match axes {
                     Some(Ok(axes)) => axes
+                        .to_device(&Device::Cpu)?
                         .to_vec1::<i64>()?
                         .into_iter()
-                        .map(|x| x as usize)
-                        .collect::<Vec<_>>(),
+                        .map(|x| input.normalize_axis(x))
+                        .collect::<Result<Vec<_>>>()?,
                     Some(Err(_)) | None => {
                         if noop_with_empty_axes == 1 {
                             vec![]
@@ -1636,10 +1697,11 @@ fn simple_eval_(
 
                 let axes = match axes {
                     Some(axes) => axes?
+                        .to_device(&Device::Cpu)?
                         .to_vec1::<i64>()?
                         .into_iter()
-                        .map(|x| x as usize)
-                        .collect::<Vec<_>>(),
+                        .map(|x| input_sq.normalize_axis(x))
+                        .collect::<Result<Vec<_>>>()?,
                     None => {
                         if noop_with_empty_axes == 1 {
                             vec![]
@@ -1695,11 +1757,11 @@ fn simple_eval_(
                 let output = if random_type == "RandomUniform" {
                     let low: f32 = get_attr_opt(node, "low")?.copied().unwrap_or(0.0);
                     let high: f32 = get_attr_opt(node, "high")?.copied().unwrap_or(1.0);
-                    Tensor::rand(low, high, shape, &Device::Cpu)?.to_dtype(dtype)?
+                    Tensor::rand(low, high, shape, device)?.to_dtype(dtype)?
                 } else {
                     let mean: f32 = get_attr_opt(node, "mean")?.copied().unwrap_or(0.0);
                     let scale: f32 = get_attr_opt(node, "scale")?.copied().unwrap_or(1.0);
-                    Tensor::randn(mean, scale, shape, &Device::Cpu)?.to_dtype(dtype)?
+                    Tensor::randn(mean, scale, shape, device)?.to_dtype(dtype)?
                 };
                 values.insert(node.output[0].clone(), output);
             }
@@ -1793,8 +1855,8 @@ fn simple_eval_(
                 let alpha = get_attr_opt::<f32>(node, "alpha")?.copied().unwrap_or(1.0);
                 let beta = get_attr_opt::<f32>(node, "beta")?.copied().unwrap_or(1.0);
 
-                let alpha = Tensor::full(alpha, a.shape(), &Device::Cpu)?;
-                let beta = Tensor::full(beta, c.shape(), &Device::Cpu)?;
+                let alpha = Tensor::full(alpha, a.shape(), a.device())?;
+                let beta = Tensor::full(beta, c.shape(), c.device())?;
 
                 let trans_a = get_attr_opt::<i64>(node, "transA")?.copied().unwrap_or(0);
                 let trans_b = get_attr_opt::<i64>(node, "transB")?.copied().unwrap_or(0);
@@ -1827,9 +1889,12 @@ fn simple_eval_(
                 let activations = get_attr_opt_owned::<Vec<String>>(node, "activations")?
                     .unwrap_or(activations_default.clone());
                 if activations != activations_default {
-                    bail!("LSTM currently only supports default activations ({activations_default:?})");
+                    bail!(
+                        "LSTM currently only supports default activations ({activations_default:?})"
+                    );
                 }
-                // activation_alpha and activation_beta don't apply to (Sigmoid, Tanh, Tanh) so ignoring them is okay
+                // activation_alpha and activation_beta don't apply to (Sigmoid, Tanh, Tanh) so
+                // ignoring them is okay
                 if get_attr_opt::<f32>(node, "clip")?.is_some() {
                     bail!("LSTM does not currently support clip attribute");
                 }
@@ -1863,9 +1928,10 @@ fn simple_eval_(
                 let r = get(&node.input[2])?;
 
                 // The bias tensor for input gate.
-                // Concatenation of `[Wb[iofc], Rb[iofc]]`, and `[WBb[iofc], RBb[iofc]]` (if bidirectional) along dimension 0.
-                // This tensor has shape `[num_directions, 8*hidden_size]`.
-                // Optional: If not specified - assumed to be 0.
+                // Concatenation of `[Wb[iofc], Rb[iofc]]`, and `[WBb[iofc], RBb[iofc]]` (if
+                // bidirectional) along dimension 0. This tensor has shape
+                // `[num_directions, 8*hidden_size]`. Optional: If not specified -
+                // assumed to be 0.
                 let b_default: Tensor;
                 let b = match get_opt(3) {
                     Some(n) => n?,
@@ -1880,8 +1946,8 @@ fn simple_eval_(
                 };
 
                 // Optional tensor specifying lengths of the sequences in a batch.
-                // If not specified - assumed all sequences in the batch to have length `seq_length`.
-                // It has shape `[batch_size]`.
+                // If not specified - assumed all sequences in the batch to have length
+                // `seq_length`. It has shape `[batch_size]`.
                 let seq_lens_default: Tensor;
                 let seq_lens = match get_opt(4) {
                     Some(n) => n?,
@@ -1892,7 +1958,7 @@ fn simple_eval_(
                     }
                 };
                 let seq_lens_is_default =
-                    (seq_lens.to_vec1::<i64>()?.iter()).all(|e| *e as usize == seq_length);
+                    (to_vec1_host::<i64>(seq_lens)?.iter()).all(|e| *e as usize == seq_length);
                 if !seq_lens_is_default {
                     bail!("LSTM currently only supports default value of seq_lens");
                 }
@@ -1930,14 +1996,16 @@ fn simple_eval_(
 
                 // The weight tensor for peepholes.
                 // Concatenation of `P[iof]` and `PB[iof]` (if bidirectional) along dimension 0.
-                // It has shape `[num_directions, 3*hidde_size]`. Optional: If not specified - assumed to be 0.
+                // It has shape `[num_directions, 3*hidde_size]`. Optional: If not specified -
+                // assumed to be 0.
                 let p_default = Tensor::zeros(
                     (num_directions, 3 * hidden_size as usize),
                     DType::F32,
                     x.device(),
                 )?;
                 let p = get_opt(7).unwrap_or(Ok(&p_default))?;
-                let p_is_zeros = (p.to_vec2::<f32>()?.iter()).all(|v| v.iter().all(|e| *e == 0.0));
+                let p_is_zeros =
+                    (to_vec2_host::<f32>(p)?.iter()).all(|v| v.iter().all(|e| *e == 0.0));
                 if !p_is_zeros {
                     bail!(
                         "LSTM currently only supports default value of p (a Tensor of all zeroes)"
@@ -1982,7 +2050,13 @@ fn simple_eval_(
                 )?;
 
                 let mut lstm_state = candle_nn::rnn::LSTMState::new(h, c);
-                let mut h_acc = if node.output.first().map(String::as_str).unwrap_or("") != "" {
+                let mut h_acc = if !node
+                    .output
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     Some(vec![])
                 } else {
                     None
@@ -1995,7 +2069,10 @@ fn simple_eval_(
                     }
                 }
 
-                assert_eq!(num_directions, 1, "if support for bidirectional is ever added, outputs will have to be concatenated, not simply reshaped");
+                assert_eq!(
+                    num_directions, 1,
+                    "if support for bidirectional is ever added, outputs will have to be concatenated, not simply reshaped"
+                );
                 if let Some(name) = node.output.first() {
                     let h_acc = h_acc.as_ref().unwrap();
                     let h_acc = lstm.states_to_tensor(h_acc)?;
@@ -2029,7 +2106,8 @@ fn simple_eval_(
                 }
             }
             "RNN" => {
-                // activation_alpha and activation_beta don't apply to (Tanh, Tanh) so ignoring them is okay
+                // activation_alpha and activation_beta don't apply to (Tanh, Tanh) so ignoring them
+                // is okay
                 let activations_default = vec!["Tanh".to_string(), "Tanh".to_string()];
                 let activations = get_attr_opt_owned::<Vec<String>>(node, "activations")?
                     .unwrap_or(activations_default.clone());
@@ -2090,8 +2168,8 @@ fn simple_eval_(
                 };
 
                 // Optional tensor specifying lengths of the sequences in a batch.
-                // If not specified - assumed all sequences in the batch to have length `seq_length`.
-                // It has shape `[batch_size]`.
+                // If not specified - assumed all sequences in the batch to have length
+                // `seq_length`. It has shape `[batch_size]`.
                 let seq_lens_default: Tensor;
                 let seq_lens = match get_opt(4) {
                     Some(n) => n?,
@@ -2102,9 +2180,12 @@ fn simple_eval_(
                     }
                 };
                 let seq_lens_is_default =
-                    (seq_lens.to_vec1::<i64>()?.iter()).all(|e| *e as usize == seq_length);
+                    (to_vec1_host::<i64>(seq_lens)?.iter()).all(|e| *e as usize == seq_length);
                 if !seq_lens_is_default {
-                    bail!("RNN currently does not support variable-length sequences. All sequences must use the full sequence length of {}", seq_length);
+                    bail!(
+                        "RNN currently does not support variable-length sequences. All sequences must use the full sequence length of {}",
+                        seq_length
+                    );
                 }
 
                 // Optional initial value of the hidden. If not specified - assumed to be 0.
@@ -2161,7 +2242,8 @@ fn simple_eval_(
             }
             // https://onnx.ai/onnx/operators/onnx__Xor.html
             "Xor" => {
-                // Since we don't have a `DType::Bool` yet, this ensures that we are working with `0`(False) & `1`(True)
+                // Since we don't have a `DType::Bool` yet, this ensures that we are working with
+                // `0`(False) & `1`(True)
                 let a = get(&node.input[0])?.gt(0_u8)?;
                 let b = get(&node.input[1])?.gt(0_u8)?;
 
@@ -2214,7 +2296,7 @@ fn simple_eval_(
                 let values_tensor = get(&node.input[2])?;
 
                 let depth = to_scalar_flexible::<i64>(depth_tensor)? as usize;
-                let values_vec = values_tensor.to_vec1::<f32>()?;
+                let values_vec = to_vec1_host::<f32>(values_tensor)?;
                 if values_vec.len() != 2 {
                     return Err(candle::Error::Msg(
                         "OneHot: expected 2-element values tensor".to_string(),
@@ -2241,7 +2323,7 @@ fn simple_eval_(
                 }
 
                 let indices = indices.flatten_all()?;
-                let indices_vec = indices.to_vec1::<i64>()?;
+                let indices_vec = to_vec1_host::<i64>(&indices)?;
                 let mut out = vec![off_value; depth * indices.elem_count()];
                 for (i, &index) in indices_vec.iter().enumerate() {
                     let idx = if index < 0 {
@@ -2276,7 +2358,7 @@ fn simple_eval_(
             }
             "HardSwish" => {
                 let input = get(&node.input[0])?;
-                let hard_sigmoid = candle_nn::ops::hard_sigmoid(&input)?;
+                let hard_sigmoid = candle_nn::ops::hard_sigmoid(input)?;
                 let output = input * hard_sigmoid;
                 values.insert(node.output[0].clone(), output?);
             }
@@ -2304,7 +2386,7 @@ fn simple_eval_(
                         bail!("Scales and sizes cannot both be set for Resize operation")
                     }
                     (Some(scales_tensor), None) => {
-                        let scale_values = scales_tensor.to_vec1::<f32>()?;
+                        let scale_values = to_vec1_host::<f32>(scales_tensor)?;
                         input
                             .dims()
                             .iter()
@@ -2313,6 +2395,7 @@ fn simple_eval_(
                             .collect::<Vec<_>>()
                     }
                     (None, Some(sizes_tensor)) => sizes_tensor
+                        .to_device(&Device::Cpu)?
                         .to_vec1::<i64>()?
                         .iter()
                         .map(|&d| d as usize)
@@ -2418,7 +2501,7 @@ fn simple_eval_(
                 let _updates_shape = updates.dims();
 
                 // Last dimension of indices represents the depth of indexing
-                let k = indices_shape.last().unwrap().clone();
+                let k = *indices_shape.last().unwrap();
 
                 if k > data.rank() {
                     bail!("ScatterND expects k (indices.shape[-1]) to be at most the rank of data");
@@ -2487,7 +2570,7 @@ fn simple_eval_(
                 // Process each update
                 for i in 0..num_updates {
                     let index_slice = flat_indices.narrow(0, i, 1)?;
-                    let indices_vec = index_slice.squeeze(0)?.to_vec1::<i64>()?;
+                    let indices_vec = to_vec1_host::<i64>(&index_slice.squeeze(0)?)?;
 
                     // Convert multi-dimensional indices to flat index
                     let mut flat_idx: usize = 0;
@@ -2527,7 +2610,7 @@ fn simple_eval_(
                                 flat_output = flat_output.slice_scatter(&new_value, 0, flat_idx)?;
                             }
                         }
-                        "none" | _ => {
+                        "none" => {
                             if update_element_shape.is_empty() {
                                 flat_output = flat_output.slice_scatter(
                                     &update_slice.unsqueeze(0)?,
@@ -2538,6 +2621,9 @@ fn simple_eval_(
                                 flat_output =
                                     flat_output.slice_scatter(&update_slice, 0, flat_idx)?;
                             }
+                        }
+                        reduction => {
+                            bail!("ScatterND unsupported reduction mode {reduction:?}");
                         }
                     }
                 }
@@ -2575,39 +2661,6 @@ fn simple_eval_(
             Some(value) => Ok((output.name.clone(), value)),
         })
         .collect()
-}
-
-fn broadcast_shape(shape_a: &[usize], shape_b: &[usize]) -> Result<Vec<usize>> {
-    let (longest, shortest) = if shape_a.len() > shape_b.len() {
-        (shape_a, shape_b)
-    } else {
-        (shape_b, shape_a)
-    };
-    let diff = longest.len() - shortest.len();
-    let mut target_shape = longest[0..diff].to_vec();
-    for (dim1, dim2) in longest[diff..].iter().zip(shortest.iter()) {
-        if *dim1 == *dim2 || *dim2 == 1 || *dim1 == 1 {
-            target_shape.push(usize::max(*dim1, *dim2));
-        } else {
-            bail!(
-                "Expand: incompatible shapes for broadcast, {:?} and {:?}",
-                shape_a,
-                shape_b
-            );
-        }
-    }
-    Ok(target_shape)
-}
-
-fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
-    if shapes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut shape_out = shapes[0].to_vec();
-    for shape in shapes[1..].iter() {
-        shape_out = broadcast_shape(&shape_out, shape)?;
-    }
-    Ok(shape_out)
 }
 
 fn grid_sample_bilinear(input: &Tensor, grid: &Tensor, align_corners: bool) -> Result<Tensor> {
@@ -2703,10 +2756,44 @@ fn unnormalize_grid_coordinate(value: f32, size: usize, align_corners: bool) -> 
     }
 }
 
+fn broadcast_shape(shape_a: &[usize], shape_b: &[usize]) -> Result<Vec<usize>> {
+    let (longest, shortest) = if shape_a.len() > shape_b.len() {
+        (shape_a, shape_b)
+    } else {
+        (shape_b, shape_a)
+    };
+    let diff = longest.len() - shortest.len();
+    let mut target_shape = longest[0..diff].to_vec();
+    for (dim1, dim2) in longest[diff..].iter().zip(shortest.iter()) {
+        if *dim1 == *dim2 || *dim2 == 1 || *dim1 == 1 {
+            target_shape.push(usize::max(*dim1, *dim2));
+        } else {
+            bail!(
+                "Expand: incompatible shapes for broadcast, {:?} and {:?}",
+                shape_a,
+                shape_b
+            );
+        }
+    }
+    Ok(target_shape)
+}
+
+fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
+    if shapes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut shape_out = shapes[0].to_vec();
+    for shape in shapes[1..].iter() {
+        shape_out = broadcast_shape(&shape_out, shape)?;
+    }
+    Ok(shape_out)
+}
+
 /// Extract scalar from tensors that may be wrapped in extra dimensions.
 /// Some ONNX exports use shape [1] or [1,1] where scalars are expected.
 /// Only accepts single-element tensors; multi-element tensors still fail.
 fn to_scalar_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
+    let t = t.to_device(&Device::Cpu)?;
     if t.rank() > 0 && t.elem_count() == 1 {
         t.flatten_all()?.i(0)?.to_scalar::<T>()
     } else {
@@ -2716,9 +2803,18 @@ fn to_scalar_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
 
 /// Same as to_scalar_flexible but returns via to_vec0 for types that need it.
 fn to_vec0_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
+    let t = t.to_device(&Device::Cpu)?;
     if t.rank() > 0 && t.elem_count() == 1 {
         t.flatten_all()?.i(0)?.to_vec0::<T>()
     } else {
         t.to_vec0::<T>()
     }
+}
+
+fn to_vec1_host<T: candle::WithDType>(t: &Tensor) -> Result<Vec<T>> {
+    t.to_device(&Device::Cpu)?.to_vec1::<T>()
+}
+
+fn to_vec2_host<T: candle::WithDType>(t: &Tensor) -> Result<Vec<Vec<T>>> {
+    t.to_device(&Device::Cpu)?.to_vec2::<T>()
 }
